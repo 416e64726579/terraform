@@ -23,8 +23,16 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/httpclient"
 	"github.com/hashicorp/terraform/internal/logging"
+	"github.com/hashicorp/terraform/internal/types"
 	"github.com/hashicorp/terraform/version"
 )
+
+type mTLSCredentials struct {
+	svcauth.HostCredentials
+	ClientCert string
+	ClientKey  string
+	TrustedCA  string
+}
 
 // HTTPMirrorSource is a source that reads provider metadata from a provider
 // mirror that is accessible over the HTTP provider mirror protocol.
@@ -316,6 +324,19 @@ func (s *HTTPMirrorSource) get(ctx context.Context, relativePath string) (status
 		// whatever hostname ends up ultimately serving the request as an
 		// implementation detail.
 		creds.PrepareRequest(req.Request)
+	}
+	if tlsProvider, ok := creds.(types.TLSConfigProvider); ok {
+		tlsConfig, err := tlsProvider.GetTLSConfig()
+		if err == nil {
+			// TODO: Comment for local testing
+			// tlsConfig.InsecureSkipVerify = true // Skip certificate validation (use with caution!)
+			// proxyFunc := http.ProxyFromEnvironment
+			// s.httpClient.HTTPClient.Transport = &http.Transport{TLSClientConfig: tlsConfig, Proxy: proxyFunc}
+
+			s.httpClient.HTTPClient.Transport = &http.Transport{TLSClientConfig: tlsConfig}
+		} else {
+			log.Printf("[ERROR] TLS Сonfig failed: %v", err)
+		}
 	}
 
 	resp, err := s.httpClient.Do(req)

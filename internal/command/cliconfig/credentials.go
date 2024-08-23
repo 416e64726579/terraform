@@ -5,10 +5,13 @@ package cliconfig
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -224,10 +227,56 @@ type CredentialsSource struct {
 	// helperType is the name of the type of credentials helper that is
 	// referenced in "helper", or the empty string if "helper" is nil.
 	helperType string
+
+	mTLSConfig
 }
 
 // Assertion that credentialsSource implements CredentialsSource
 var _ svcauth.CredentialsSource = (*CredentialsSource)(nil)
+
+func mTLSCredentialsFromObject(obj cty.Value) *mTLSConfig {
+	if !obj.Type().HasAttribute("client_cert") {
+		return nil
+	}
+
+	if !obj.Type().HasAttribute("client_key") {
+		return nil
+	}
+
+	if !obj.Type().HasAttribute("trusted_ca") {
+		return nil
+	}
+
+	cert := obj.GetAttr("client_cert")
+	if cert.IsNull() || !cert.IsKnown() {
+		return nil
+	}
+	if !cty.String.Equals(cert.Type()) {
+		return nil
+	}
+
+	key := obj.GetAttr("client_key")
+	if key.IsNull() || !key.IsKnown() {
+		return nil
+	}
+	if !cty.String.Equals(key.Type()) {
+		return nil
+	}
+
+	trustedCA := obj.GetAttr("trusted_ca")
+	if trustedCA.IsNull() || !trustedCA.IsKnown() {
+		return nil
+	}
+	if !cty.String.Equals(trustedCA.Type()) {
+		return nil
+	}
+
+	return &mTLSConfig{
+		ClientCert: cert.AsString(),
+		ClientKey:  key.AsString(),
+		TrustedCA:  trustedCA.AsString(),
+	}
+}
 
 func (s *CredentialsSource) ForHost(host svchost.Hostname) (svcauth.HostCredentials, error) {
 	// The first order of precedence for credentials is a host-specific environment variable
@@ -238,12 +287,26 @@ func (s *CredentialsSource) ForHost(host svchost.Hostname) (svcauth.HostCredenti
 	// Then, any credentials block present in the CLI config
 	v, ok := s.configured[host]
 	if ok {
-		return svcauth.HostCredentialsFromObject(v), nil
+		creds := svcauth.HostCredentialsFromObject(v)
+		configTLS := mTLSCredentialsFromObject(v)
+		log.Printf("[DEBUG] TLS Config Paths: %v", configTLS)
+		return &mTLSCredentials{
+			HostCredentials: creds,
+			mTLSConfig:      *configTLS,
+		}, nil
 	}
 
 	// And finally, the credentials helper
 	if s.helper != nil {
-		return s.helper.ForHost(host)
+		creds, err := s.helper.ForHost(host)
+		if err != nil || creds == nil {
+			return creds, err
+		}
+		configTLS := mTLSCredentialsFromObject(v)
+		return &mTLSCredentials{
+			HostCredentials: creds,
+			mTLSConfig:      *configTLS,
+		}, nil
 	}
 
 	return nil, nil
@@ -526,3 +589,45 @@ const (
 	// or may not have credentials for the host.
 	CredentialsViaHelper CredentialsLocation = 'H'
 )
+
+type mTLSConfig struct {
+	ClientCert string
+	ClientKey  string
+	TrustedCA  string
+}
+
+type mTLSCredentials struct {
+	svcauth.HostCredentials
+	mTLSConfig
+}
+
+// Implement the interface
+func (c *mTLSCredentials) GetTLSConfig() (*tls.Config, error) {
+	return setupTLSConfig(c.mTLSConfig.ClientCert, c.mTLSConfig.ClientKey, c.mTLSConfig.TrustedCA)
+}
+
+func setupTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load X509 key pair: %v", err)
+	}
+
+	caCert, err := os.ReadFile(caPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA certificate: %v", err)
+	}
+
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      caCertPool,
+	}, nil
+}
+
+func (c *mTLSCredentials) PrepareRequest(req *http.Request) {
+	if c.HostCredentials != nil {
+		c.HostCredentials.PrepareRequest(req) // Fall back to original behavior
+	}
+}
