@@ -30,7 +30,6 @@ func (d *Dir) InstallPackage(ctx context.Context, meta getproviders.PackageMeta,
 	// Invalidate our metaCache so that subsequent read calls will re-scan to
 	// incorporate any changes we make here.
 	d.metaCache = nil
-
 	log.Printf("[TRACE] providercache.Dir.InstallPackage: installing %s v%s from %s", meta.Provider, meta.Version, meta.Location)
 	switch meta.Location.(type) {
 	case getproviders.PackageHTTPURL:
