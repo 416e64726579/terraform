@@ -5,13 +5,10 @@ package cliconfig
 
 import (
 	"bytes"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -173,6 +170,69 @@ func collectCredentialsFromEnv() map[svchost.Hostname]string {
 	return ret
 }
 
+func collectMTLSCredentialsFromEnv() map[svchost.Hostname]*svcauth.HostCredentialsMTLS {
+	// Prefixes for environment variables
+	const (
+		prefixCert   = "TF_CLIENT_CERT_"
+		prefixKey    = "TF_CLIENT_KEY_"
+		prefixCACert = "TF_CA_CERT_"
+	)
+
+	ret := make(map[svchost.Hostname]*svcauth.HostCredentialsMTLS)
+
+	for _, ev := range os.Environ() {
+		eqIdx := strings.Index(ev, "=")
+		if eqIdx < 0 {
+			continue
+		}
+		name := ev[:eqIdx]
+		value := ev[eqIdx+1:]
+
+		var rawHost, cert, key, caCert string
+
+		// Determine the type of credential and parse accordingly
+		if strings.HasPrefix(name, prefixCert) {
+			rawHost = name[len(prefixCert):]
+			cert = value
+		} else if strings.HasPrefix(name, prefixKey) {
+			rawHost = name[len(prefixKey):]
+			key = value
+		} else if strings.HasPrefix(name, prefixCACert) {
+			rawHost = name[len(prefixCACert):]
+			caCert = value
+		} else {
+			continue
+		}
+
+		// Normalize the hostname
+		rawHost = strings.ReplaceAll(rawHost, "__", "-")
+		rawHost = strings.ReplaceAll(rawHost, "_", ".")
+		dispHost := svchost.ForDisplay(rawHost)
+		hostname, err := svchost.ForComparison(dispHost)
+		if err != nil {
+			continue
+		}
+
+		// Retrieve or create the entry in the map
+		if ret[hostname] == nil {
+			ret[hostname] = &svcauth.HostCredentialsMTLS{}
+		}
+
+		// Update the corresponding fields
+		if cert != "" {
+			ret[hostname].ClientCert = cert
+		}
+		if key != "" {
+			ret[hostname].ClientKey = key
+		}
+		if caCert != "" {
+			ret[hostname].CACertificate = caCert
+		}
+	}
+
+	return ret
+}
+
 // hostCredentialsFromEnv returns a token credential by searching for a hostname-specific
 // environment variable. The host parameter is expected to be in the "comparison" form,
 // for example, hostnames containing non-ASCII characters like "café.fr"
@@ -186,11 +246,26 @@ func collectCredentialsFromEnv() map[svchost.Hostname]string {
 // For the example "café.fr", you may use the variable names "TF_TOKEN_xn____caf__dma_fr",
 // "TF_TOKEN_xn--caf-dma_fr", or "TF_TOKEN_xn--caf-dma.fr"
 func hostCredentialsFromEnv(host svchost.Hostname) svcauth.HostCredentials {
-	token, ok := collectCredentialsFromEnv()[host]
-	if !ok {
-		return nil
+	token, tokenOk := collectCredentialsFromEnv()[host]
+	mtlsCreds, mtlsOk := collectMTLSCredentialsFromEnv()[host]
+
+	// If both mTLS and token are found, combine them
+	if mtlsOk && tokenOk {
+		mtlsCreds.TokenValue = token
+		return mtlsCreds
 	}
-	return svcauth.HostCredentialsToken(token)
+
+	// If only mTLS credentials are found
+	if mtlsOk {
+		return mtlsCreds
+	}
+
+	// If only token credentials are found
+	if tokenOk {
+		return svcauth.HostCredentialsToken(token)
+	}
+
+	return nil
 }
 
 // CredentialsSource is an implementation of svcauth.CredentialsSource
@@ -227,93 +302,50 @@ type CredentialsSource struct {
 	// helperType is the name of the type of credentials helper that is
 	// referenced in "helper", or the empty string if "helper" is nil.
 	helperType string
-
-	mTLSConfig
 }
 
 // Assertion that credentialsSource implements CredentialsSource
 var _ svcauth.CredentialsSource = (*CredentialsSource)(nil)
 
-func mTLSCredentialsFromObject(obj cty.Value) *mTLSConfig {
-	if !obj.Type().HasAttribute("client_cert") {
-		return nil
-	}
-
-	if !obj.Type().HasAttribute("client_key") {
-		return nil
-	}
-
-	if !obj.Type().HasAttribute("trusted_ca") {
-		return nil
-	}
-
-	cert := obj.GetAttr("client_cert")
-	if cert.IsNull() || !cert.IsKnown() {
-		return nil
-	}
-	if !cty.String.Equals(cert.Type()) {
-		return nil
-	}
-
-	key := obj.GetAttr("client_key")
-	if key.IsNull() || !key.IsKnown() {
-		return nil
-	}
-	if !cty.String.Equals(key.Type()) {
-		return nil
-	}
-
-	trustedCA := obj.GetAttr("trusted_ca")
-	if trustedCA.IsNull() || !trustedCA.IsKnown() {
-		return nil
-	}
-	if !cty.String.Equals(trustedCA.Type()) {
-		return nil
-	}
-
-	return &mTLSConfig{
-		ClientCert: cert.AsString(),
-		ClientKey:  key.AsString(),
-		TrustedCA:  trustedCA.AsString(),
-	}
-}
-
 func (s *CredentialsSource) ForHost(host svchost.Hostname) (svcauth.HostCredentials, error) {
+	var token string
+
 	// The first order of precedence for credentials is a host-specific environment variable
 	if envCreds := hostCredentialsFromEnv(host); envCreds != nil {
-		return envCreds, nil
+		token = envCreds.Token()
+		if mtls, ok := envCreds.(svcauth.HostCredentialsExtended); ok {
+			mtls.SetToken(token)
+			return mtls, nil
+		}
+		return svcauth.HostCredentialsToken(token), nil
 	}
 
 	// Then, any credentials block present in the CLI config
-	v, ok := s.configured[host]
-	if ok {
+	if v, ok := s.configured[host]; ok {
 		creds := svcauth.HostCredentialsFromObject(v)
-		configTLS := mTLSCredentialsFromObject(v)
-		log.Printf("[DEBUG] TLS Config Paths: %v", configTLS)
-		if configTLS.ClientCert != "" {
-			return &mTLSCredentials{
-				HostCredentials: creds,
-				mTLSConfig:      *configTLS,
-			}, nil
-		} else {
-			return creds, nil
+		if creds != nil {
+			token = creds.Token()
+			if mtls, ok := creds.(svcauth.HostCredentialsExtended); ok {
+				mtls.SetToken(token)
+				return mtls, nil
+			}
+			return svcauth.HostCredentialsToken(token), nil
 		}
 	}
 
 	// And finally, the credentials helper
 	if s.helper != nil {
 		creds, err := s.helper.ForHost(host)
-		if err != nil || creds == nil {
-			return creds, err
+		if err != nil {
+			return nil, err
 		}
-		configTLS := mTLSCredentialsFromObject(v)
-		if configTLS.ClientCert != "" {
-			return &mTLSCredentials{
-				HostCredentials: creds,
-				mTLSConfig:      *configTLS,
-			}, nil
-		} else {
-			return creds, nil
+		if creds != nil {
+			token = creds.Token()
+			if mtls, ok := creds.(svcauth.HostCredentialsExtended); ok {
+				mtls.SetToken(token)
+				return mtls, nil
+			}
+			return svcauth.HostCredentialsToken(token), nil
 		}
 	}
 
@@ -597,45 +629,3 @@ const (
 	// or may not have credentials for the host.
 	CredentialsViaHelper CredentialsLocation = 'H'
 )
-
-type mTLSConfig struct {
-	ClientCert string
-	ClientKey  string
-	TrustedCA  string
-}
-
-type mTLSCredentials struct {
-	svcauth.HostCredentials
-	mTLSConfig
-}
-
-// Implement the interface
-func (c *mTLSCredentials) GetTLSConfig() (*tls.Config, error) {
-	return setupTLSConfig(c.mTLSConfig.ClientCert, c.mTLSConfig.ClientKey, c.mTLSConfig.TrustedCA)
-}
-
-func setupTLSConfig(certPath, keyPath, caPath string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load X509 key pair: %v", err)
-	}
-
-	caCert, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read CA certificate: %v", err)
-	}
-
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
-
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caCertPool,
-	}, nil
-}
-
-func (c *mTLSCredentials) PrepareRequest(req *http.Request) {
-	if c.HostCredentials != nil {
-		c.HostCredentials.PrepareRequest(req) // Fall back to original behavior
-	}
-}

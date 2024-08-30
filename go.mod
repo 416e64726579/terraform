@@ -35,7 +35,7 @@ require (
 	github.com/hashicorp/hcl/v2 v2.20.0
 	github.com/hashicorp/jsonapi v1.3.1
 	github.com/hashicorp/terraform-registry-address v0.2.3
-	github.com/hashicorp/terraform-svchost v0.1.1
+	github.com/hashicorp/terraform-svchost v0.1.2
 	github.com/hashicorp/terraform/internal/backend/remote-state/azure v0.0.0-00010101000000-000000000000
 	github.com/hashicorp/terraform/internal/backend/remote-state/consul v0.0.0-00010101000000-000000000000
 	github.com/hashicorp/terraform/internal/backend/remote-state/cos v0.0.0-00010101000000-000000000000
@@ -316,3 +316,5 @@ replace github.com/hashicorp/terraform/internal/backend/remote-state/pg => ./int
 replace github.com/hashicorp/terraform/internal/backend/remote-state/s3 => ./internal/backend/remote-state/s3
 
 replace github.com/hashicorp/terraform/internal/legacy => ./internal/legacy
+
+replace github.com/hashicorp/terraform-svchost v0.1.2 => /Users/apetriv/sre/git-repos/terraform-svchost

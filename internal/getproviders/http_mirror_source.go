@@ -23,7 +23,6 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/httpclient"
 	"github.com/hashicorp/terraform/internal/logging"
-	"github.com/hashicorp/terraform/internal/types"
 	"github.com/hashicorp/terraform/version"
 )
 
@@ -229,7 +228,7 @@ func (s *HTTPMirrorSource) PackageMeta(ctx context.Context, provider addrs.Provi
 		log.Printf("[DEBUG] Mirror credentials for mTLS failed: %v", err)
 	}
 
-	if tlsProvider, ok := creds.(types.TLSConfigProvider); ok {
+	if tlsProvider, ok := creds.(svcauth.HostCredentialsExtended); ok {
 		tlsConfig, err := tlsProvider.GetTLSConfig()
 		if err == nil {
 			ret.Credentials = tlsConfig.Clone()
@@ -333,13 +332,12 @@ func (s *HTTPMirrorSource) get(ctx context.Context, relativePath string) (status
 	}
 
 	// Apply mTLS configuration if available
-	if tlsProvider, ok := creds.(types.TLSConfigProvider); ok {
-		tlsConfig, err := tlsProvider.GetTLSConfig()
-		if err == nil {
-			// Use the mTLS configuration
+	if tlsProvider, ok := creds.(svcauth.HostCredentialsExtended); ok {
+		if tlsConfig, err := tlsProvider.GetTLSConfig(); err == nil {
 			s.httpClient.HTTPClient.Transport = &http.Transport{TLSClientConfig: tlsConfig}
 		} else {
-			log.Printf("[ERROR] TLS Сonfig failed: %v", err)
+			// Log an warning but let it try to load a file without mTLS
+			log.Printf("[WARN] mTLS config initialization failed: %v", err)
 		}
 	}
 
